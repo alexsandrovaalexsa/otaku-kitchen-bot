@@ -42,6 +42,13 @@ def _load_from_db(seed):
                     value TEXT NOT NULL
                 )
             ''')
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS otaku_users (
+                    user_id BIGINT PRIMARY KEY,
+                    data JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
             cur.execute("SELECT value FROM otaku_settings WHERE key = 'seed_complete'")
             if cur.fetchone() is None:
                 # Never replace newer recipes that arrived before seeding.
@@ -104,3 +111,44 @@ def save_local_recipes(data):
     temp = RECIPES_PATH.with_suffix('.json.tmp')
     temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
     temp.replace(RECIPES_PATH)
+
+
+# User preferences, favorites and active query survive Render sleeping/restarting.
+_LOCAL_USERS = {}
+
+
+def read_user(user_id):
+    user_id = int(user_id)
+    if not DB_URL:
+        return dict(_LOCAL_USERS.get(user_id, {}))
+    with _connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute('SELECT data FROM otaku_users WHERE user_id = %s', (user_id,))
+            row = cur.fetchone()
+    return dict(row[0]) if row and isinstance(row[0], dict) else {}
+
+
+def save_user(user_id, data):
+    user_id = int(user_id)
+    if not DB_URL:
+        _LOCAL_USERS[user_id] = dict(data)
+        return
+    from psycopg.types.json import Jsonb
+    with _connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO otaku_users (user_id, data, updated_at)
+                VALUES (%s, %s, NOW())
+                ON CONFLICT (user_id) DO UPDATE
+                SET data = EXCLUDED.data, updated_at = NOW()
+            """, (user_id, Jsonb(data)))
+
+
+def delete_user(user_id):
+    user_id = int(user_id)
+    if not DB_URL:
+        _LOCAL_USERS.pop(user_id, None)
+        return
+    with _connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute('DELETE FROM otaku_users WHERE user_id = %s', (user_id,))
