@@ -9,28 +9,18 @@ import time
 import urllib.request
 import urllib.error
 from collections import Counter
-from pathlib import Path
 from catalog import parse_post
+import db_store
 from search_engine import find_recipes, shopping_item, parse_products
 
 TOKEN = os.environ.get('BOT_TOKEN', '').strip()
 if not TOKEN:
     sys.exit('BOT_TOKEN not set. Create a bot in @BotFather, then set environment variable BOT_TOKEN.')
 API = f'https://api.telegram.org/bot{TOKEN}/'
-RECIPES_PATH = Path(__file__).with_name('recipes.json')
 
 
-def read_recipes():
-    return json.loads(RECIPES_PATH.read_text(encoding='utf-8'))
-
-
-def save_recipes(data):
-    temporary = RECIPES_PATH.with_suffix('.json.tmp')
-    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
-    temporary.replace(RECIPES_PATH)
-
-
-recipes = read_recipes()
+# PostgreSQL is authoritative on Render; recipes.json seeds it on first run.
+recipes = db_store.load_recipes()
 user_state = {}  # Memory-only conversation state. Recipes persist to file.
 
 
@@ -164,23 +154,39 @@ def anime_page(chat, q, page=0):
     send(chat,'\n'.join(lines),kb)
 
 
-def handle_channel_post(item):
+def handle_channel_post(item, edited=False):
+    """Persist channel posts before confirming Telegram's webhook delivery.
+
+    Only the selected public channel is accepted. An edited post without a
+    recipe category is removed from search; an ordinary untagged post is ignored.
+    """
     global recipes
-    chat=item.get('chat', {})
-    if chat.get('username','').lower() != 'otakukitchen':
+    chat = item.get('chat', {})
+    if chat.get('username', '').lower() != 'otakukitchen':
         return
-    post = {'id':item['message_id'],'type':'message','text':item.get('text') or item.get('caption','')}
+    message_id = item.get('message_id')
+    if not isinstance(message_id, int):
+        return
+    post = {'id': message_id, 'type': 'message',
+            'text': item.get('text') or item.get('caption') or ''}
     new = parse_post(post)
-    if not new:
+    if new is None:
+        if edited and any(r['id'] == message_id for r in recipes):
+            if db_store.database_enabled():
+                db_store.delete_recipe(message_id)
+            recipes = [r for r in recipes if r['id'] != message_id]
+            if not db_store.database_enabled():
+                db_store.save_local_recipes(recipes)
+            print('Recipe removed after edit:', message_id, flush=True)
         return
-    idx = next((i for i,r in enumerate(recipes) if r['id']==new['id']), None)
-    if idx is None:
-        recipes.append(new)
-        print('New recipe:',new['id'],flush=True)
-    else:
-        recipes[idx]=new
-        print('Recipe updated:',new['id'],flush=True)
-    save_recipes(recipes)
+    # Fail on storage issues rather than silently lose the post. Telegram
+    # will retry a webhook when it receives an HTTP error.
+    if db_store.database_enabled():
+        db_store.upsert_recipe(new)
+    recipes = [r for r in recipes if r['id'] != new['id']] + [new]
+    if not db_store.database_enabled():
+        db_store.save_local_recipes(recipes)
+    print('Recipe stored:', new['id'], '(needs review)' if new['needs_review'] else '', flush=True)
 
 
 def handle_callback(cb):
@@ -233,7 +239,7 @@ def run():
                 offset=update['update_id']+1
                 try:
                     if 'channel_post' in update: handle_channel_post(update['channel_post'])
-                    elif 'edited_channel_post' in update: handle_channel_post(update['edited_channel_post'])
+                    elif 'edited_channel_post' in update: handle_channel_post(update['edited_channel_post'], edited=True)
                     elif 'callback_query' in update: handle_callback(update['callback_query'])
                     elif 'message' in update: handle_message(update['message'])
                 except Exception as exc:

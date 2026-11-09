@@ -1,7 +1,7 @@
 """Run the Otaku Kitchen Telegram bot as a secure HTTPS webhook on Render.
 
 Render provides HTTPS and the RENDER_EXTERNAL_URL environment variable.
-This application uses only the Python standard library.
+It uses psycopg to save channel recipes in Neon PostgreSQL.
 """
 import hashlib
 import hmac
@@ -14,6 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 import bot
+import db_store
 
 # Derive a valid Telegram webhook secret; there is no need to copy it into GitHub.
 WEBHOOK_SECRET = hashlib.sha256(bot.TOKEN.encode('utf-8')).hexdigest()
@@ -21,15 +22,11 @@ WORK_QUEUE = queue.Queue(maxsize=1000)
 
 
 def worker():
-    """Handle updates sequentially to keep chat state and recipe updates ordered."""
+    """Handle user messages and callbacks; keep their flow sequential."""
     while True:
         update = WORK_QUEUE.get()
         try:
-            if 'channel_post' in update:
-                bot.handle_channel_post(update['channel_post'])
-            elif 'edited_channel_post' in update:
-                bot.handle_channel_post(update['edited_channel_post'])
-            elif 'callback_query' in update:
+            if 'callback_query' in update:
                 bot.handle_callback(update['callback_query'])
             elif 'message' in update:
                 bot.handle_message(update['message'])
@@ -41,7 +38,7 @@ def worker():
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        # Simple, safe health-check. No token, channel data, or user messages.
+        # Safe health-check. No token, database URL, or user messages.
         if urlparse(self.path).path != '/':
             self.send_error(404)
             return
@@ -51,6 +48,14 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Content-Length', str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def do_HEAD(self):
+        if urlparse(self.path).path != '/':
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header('Content-Length', '0')
+        self.end_headers()
 
     def do_POST(self):
         if urlparse(self.path).path != '/telegram':
@@ -75,14 +80,25 @@ class Handler(BaseHTTPRequestHandler):
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
             self.send_error(400)
             return
+        # Channel updates must reach the persistent database BEFORE we reply
+        # 200. If Neon is temporarily unavailable, return 503 and let Telegram
+        # retry. UPSERT and DELETE are idempotent for repeated deliveries.
         try:
-            WORK_QUEUE.put_nowait(update)
+            if 'channel_post' in update:
+                bot.handle_channel_post(update['channel_post'])
+            elif 'edited_channel_post' in update:
+                bot.handle_channel_post(update['edited_channel_post'], edited=True)
+            else:
+                WORK_QUEUE.put_nowait(update)
         except queue.Full:
-            # Telegram retries if we respond with a non-2xx status.
             self.send_error(503)
             return
-        # Return quickly even when Render is warming up; requests are handled
-        # in a worker to avoid Telegram webhook timeouts during API calls.
+        except Exception as ex:
+            print(f'Cannot persist channel update: {type(ex).__name__}', flush=True)
+            self.send_error(503)
+            return
+        # User messages remain fast and asynchronous; channel posts are now
+        # stored durably before they are acknowledged.
         self.send_response(200)
         self.send_header('Content-Length', '2')
         self.end_headers()
@@ -120,6 +136,8 @@ def register_webhook():
 
 
 def main():
+    if not db_store.database_enabled():
+        raise SystemExit('DATABASE_URL not set. Configure Neon in Render Environment before deploying.')
     port = int(os.environ.get('PORT', '10000'))
     threading.Thread(target=worker, name='telegram-worker', daemon=True).start()
     server = ThreadingHTTPServer(('0.0.0.0', port), Handler)
