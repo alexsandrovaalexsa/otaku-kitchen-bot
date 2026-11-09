@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: otaku-kitchen-recipes-bot
+    runtime: python
+    plan: free
+    buildCommand: "python -m compileall -q ."
+    startCommand: "python webhook.py"
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
